@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
     # Gemini — Processing Layer (free tier)
     GEMINI_API_KEY: str = "put your gimni api key here"
-    PROCESSING_MODEL: str = "Gemma 3 27B"
+    PROCESSING_MODEL: str = "Gemini 2.5 Flash"
 
     # YouTube Data API v3 (free)
     YOUTUBE_API_KEY: str = "put your youtube api key here"
