@@ -33,6 +33,7 @@ class FilterResult(BaseModel):
 class SummaryResult(BaseModel):
     summary: str
     key_points: list[str]
+    explanation: str          # NEW: simple beginner-friendly explanation
 
 
 # ─────────────────────────────────────────
@@ -49,7 +50,7 @@ class QAResult(BaseModel):
 
 
 # ─────────────────────────────────────────
-# YouTube schemas (new)
+# YouTube schemas
 # ─────────────────────────────────────────
 class YouTubeVideo(BaseModel):
     title: str
@@ -67,14 +68,12 @@ class YouTubeResult(BaseModel):
 
 
 # ─────────────────────────────────────────
-# Final process response — all outputs
+# Final process response
 # ─────────────────────────────────────────
 class ProcessResponse(BaseModel):
-    # Filter info
     word_count: int | None = None
     detected_topic: str | None = None
     confidence: float | None = None
-    # Outputs
     summary: SummaryResult | None = None
     qa: QAResult | None = None
     youtube: YouTubeResult | None = None

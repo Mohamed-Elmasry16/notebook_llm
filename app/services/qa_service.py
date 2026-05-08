@@ -1,16 +1,16 @@
-import google.generativeai as genai
-from app.core.config import settings
+"""
+Q&A Generator Service
+---------------------
+Generates question-and-answer pairs from document text.
+Uses the LLM fallback chain (OpenRouter → Gemini → Groq).
 
-genai.configure(api_key=settings.GEMINI_API_KEY)
-model = genai.GenerativeModel(settings.PROCESSING_MODEL)
-
-
-def _call_gemini(prompt: str) -> str:
-    response = model.generate_content(prompt)
-    return response.text.strip()
+For long documents: generates Q&A per chunk then picks the best ones.
+"""
+from app.services.llm_client import call_llm
 
 
 def _chunk_text(text: str, chunk_size: int = 3000, overlap: int = 200) -> list[str]:
+    """Splits text into overlapping chunks."""
     words = text.split()
     chunks = []
     start = 0
@@ -22,17 +22,16 @@ def _chunk_text(text: str, chunk_size: int = 3000, overlap: int = 200) -> list[s
 
 
 # ─────────────────────────────────────────
-# Q&A Generator
+# Main Entry Point
 # ─────────────────────────────────────────
 async def generate_qa(text: str, topic: str | None = None, num_questions: int = 5) -> list[dict]:
     """
-    Generates Q&A pairs from document text.
-    - Short docs: single pass
-    - Long docs: generate from each chunk then deduplicate
+    Generates Q&A pairs from document.
+    - Short docs (< 3000 words): single pass
+    - Long docs: generate per chunk, then pick best
     Returns list of {"question": ..., "answer": ...}
     """
     words = text.split()
-
     if len(words) < 3000:
         return await _qa_short(text, topic, num_questions)
     else:
@@ -51,40 +50,38 @@ Document:
 \"\"\"
 
 Rules:
-- Questions must test understanding, not just memorization
-- Answers must be clear, complete, and accurate based on the document
-- Cover different parts of the document
+- Questions must test understanding and critical thinking, not just memorization
+- Answers must be complete, accurate, and based only on the document
+- Cover different parts and topics within the document
 - Use the same language as the document
 - Do NOT number the questions
 
-Respond in this EXACT format, repeating for each Q&A pair:
+Respond in this EXACT format, one pair at a time:
 Q: [question here]
 A: [answer here]
 ---"""
 
-    raw = _call_gemini(prompt)
+    raw = await call_llm(prompt)
     return _parse_qa(raw, num_questions)
 
 
 async def _qa_long(text: str, topic: str | None, num_questions: int) -> list[dict]:
-    """Generate Q&A from each chunk, then pick the best ones."""
+    """Generate Q&A per chunk, then select the best diverse ones."""
     chunks = _chunk_text(text, chunk_size=3000, overlap=200)
     topic_hint = f"The document is about: {topic}." if topic else ""
-
-    # Questions per chunk — distribute evenly
     per_chunk = max(2, num_questions // len(chunks) + 1)
     all_qa = []
 
     for i, chunk in enumerate(chunks):
         prompt = f"""You are an expert educator. {topic_hint}
-Generate {per_chunk} question-and-answer pairs from this section of a document.
+Generate {per_chunk} question-and-answer pairs from this section.
 Section {i+1} of {len(chunks)}:
 \"\"\"
 {chunk}
 \"\"\"
 
 Rules:
-- Questions must test understanding
+- Questions must test understanding, not memorization
 - Answers must be complete and accurate
 - Use the same language as the document
 - Do NOT number the questions
@@ -93,12 +90,10 @@ Respond in this EXACT format:
 Q: [question here]
 A: [answer here]
 ---"""
+        raw = await call_llm(prompt)
+        all_qa.extend(_parse_qa(raw, per_chunk))
 
-        raw = _call_gemini(prompt)
-        chunk_qa = _parse_qa(raw, per_chunk)
-        all_qa.extend(chunk_qa)
-
-    # If we have more than needed, pick the best via Gemini
+    # Pick best diverse questions if we have more than needed
     if len(all_qa) > num_questions:
         all_qa = await _pick_best_qa(all_qa, num_questions, topic)
 
@@ -106,14 +101,12 @@ A: [answer here]
 
 
 async def _pick_best_qa(qa_list: list[dict], num_questions: int, topic: str | None) -> list[dict]:
-    """Ask Gemini to pick the most diverse and important questions."""
+    """Ask LLM to pick the most diverse and important questions."""
     topic_hint = f"Topic: {topic}." if topic else ""
-    formatted = "\n".join(
-        [f"Q: {item['question']}\nA: {item['answer']}\n---" for item in qa_list]
-    )
+    formatted = "\n".join([f"Q: {q['question']}\nA: {q['answer']}\n---" for q in qa_list])
 
     prompt = f"""You have these Q&A pairs from a document. {topic_hint}
-Pick the best {num_questions} pairs that are most diverse, important, and cover different aspects.
+Pick the best {num_questions} pairs that are most diverse and cover different aspects.
 
 Q&A pairs:
 \"\"\"
@@ -125,7 +118,7 @@ Q: [question here]
 A: [answer here]
 ---"""
 
-    raw = _call_gemini(prompt)
+    raw = await call_llm(prompt)
     return _parse_qa(raw, num_questions)
 
 
@@ -135,8 +128,6 @@ A: [answer here]
 def _parse_qa(raw: str, expected: int) -> list[dict]:
     """Parses Q:/A: format into list of dicts."""
     qa_list = []
-
-    # Split by separator
     blocks = raw.split("---")
 
     for block in blocks:
@@ -144,12 +135,11 @@ def _parse_qa(raw: str, expected: int) -> list[dict]:
         if not block:
             continue
 
-        lines = block.split("\n")
         question = ""
         answer_lines = []
         in_answer = False
 
-        for line in lines:
+        for line in block.split("\n"):
             line = line.strip()
             if line.startswith("Q:"):
                 question = line[2:].strip()
@@ -161,7 +151,6 @@ def _parse_qa(raw: str, expected: int) -> list[dict]:
                 answer_lines.append(line)
 
         answer = " ".join(answer_lines).strip()
-
         if question and answer:
             qa_list.append({"question": question, "answer": answer})
 
