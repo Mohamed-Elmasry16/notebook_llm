@@ -3,26 +3,31 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # ─────────────────────────────────────────
-    # Groq — Filter Layer + Processing Backup 3
+    # Groq — Filter Layer (primary)
+    # Get key from: console.groq.com
     # ─────────────────────────────────────────
     GROQ_API_KEY: str = ""
     CLASSIFIER_MODEL: str = "llama-3.3-70b-versatile"
 
     # ─────────────────────────────────────────
-    # OpenRouter — Primary Processing
+    # OpenRouter — Processing Primary + Filter Backups
     # Get key from: openrouter.ai
+    # Models used:
+    #   Filter Backup 1 : qwen/qwen3-coder-480b-a35b:free
+    #   Filter Backup 2 : z-ai/glm-4.5-air:free
+    #   Processing      : qwen/qwen3-coder-480b-a35b:free
     # ─────────────────────────────────────────
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_MODEL: str = "qwen/qwen3-coder-480b-a35b:free"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
     # ─────────────────────────────────────────
-    # Gemini — Backup 1 & 2
+    # Gemini — Processing Backup 1 & 2
     # Get key from: aistudio.google.com
     # ─────────────────────────────────────────
     GEMINI_API_KEY: str = ""
-    GEMINI_BACKUP_1: str = "gemini-2.5-flash-lite-preview-06-17"  # Backup 1
-    GEMINI_BACKUP_2: str = "gemini-2.5-flash-preview-05-20"        # Backup 2
+    GEMINI_BACKUP_1: str = "gemini-2.5-flash-lite-preview-06-17"
+    GEMINI_BACKUP_2: str = "gemini-2.5-flash-preview-05-20"
 
     # ─────────────────────────────────────────
     # YouTube Data API v3
