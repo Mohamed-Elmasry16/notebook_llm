@@ -1,26 +1,72 @@
-import magic
 import json
+import httpx
 from groq import Groq
 from fastapi import UploadFile
 from app.core.config import settings
 from app.core.schemas import FilterResult, FilterStatus, RejectionReason
 
-client = Groq(api_key=settings.GROQ_API_KEY)
+groq_client = Groq(api_key=settings.GROQ_API_KEY)
+
+# Magic bytes for file type detection
+MAGIC_BYTES = {
+    "pdf": [b"%PDF"],
+    "docx": [b"PK\x03\x04"],
+    "txt": [],
+}
 
 
+# ─────────────────────────────────────────
+# LLM Caller with Fallback
+# ─────────────────────────────────────────
 def _call_groq(prompt: str, max_tokens: int = 200) -> str:
-    """Single helper for all Groq calls — keeps things DRY."""
-    response = client.chat.completions.create(
+    """Primary: Groq Llama 3.3."""
+    response = groq_client.chat.completions.create(
         model=settings.CLASSIFIER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
-        temperature=0,  # deterministic — important for classifiers
+        temperature=0,
     )
     return response.choices[0].message.content.strip()
 
 
+async def _call_openrouter(prompt: str, max_tokens: int = 200) -> str:
+    """Backup: OpenRouter (Qwen3 free) — used when Groq hits rate limit."""
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://notebook-llm.app",
+        "X-Title": "Notebook LLM",
+    }
+    payload = {
+        "model": settings.OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{settings.OPENROUTER_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+
+async def _call_filter_llm(prompt: str, max_tokens: int = 200) -> str:
+    """
+    Tries Groq first, falls back to OpenRouter if Groq fails.
+    Groq fails on: rate limit (429), service errors (5xx).
+    """
+    try:
+        return _call_groq(prompt, max_tokens)
+    except Exception as e:
+        print(f"[Filter] Groq failed: {e} — falling back to OpenRouter...")
+        return await _call_openrouter(prompt, max_tokens)
+
+
 def _parse_json(raw: str) -> dict:
-    """Strips markdown fences and parses JSON safely."""
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -28,13 +74,20 @@ def _parse_json(raw: str) -> dict:
     return json.loads(raw.strip())
 
 
+def _check_magic_bytes(content: bytes, ext: str) -> bool:
+    signatures = MAGIC_BYTES.get(ext, [])
+    if not signatures:
+        return True
+    return any(content.startswith(sig) for sig in signatures)
+
+
 # ─────────────────────────────────────────
 # Layer 1: Hard Filter
 # ─────────────────────────────────────────
 async def hard_filter(file: UploadFile, content: bytes) -> FilterResult | None:
-    """Validates file type and size. No LLM — instant."""
-
+    """Validates file type and size. No LLM — pure Python."""
     ext = file.filename.split(".")[-1].lower() if "." in file.filename else ""
+
     if ext not in settings.ALLOWED_EXTENSIONS:
         return FilterResult(
             status=FilterStatus.REJECTED,
@@ -42,9 +95,7 @@ async def hard_filter(file: UploadFile, content: bytes) -> FilterResult | None:
             message=f"File type '.{ext}' not supported. Allowed: pdf, docx, txt",
         )
 
-    mime = magic.from_buffer(content[:2048], mime=True)
-    expected_mime = settings.ALLOWED_MIME_TYPES.get(ext, "")
-    if ext != "txt" and mime != expected_mime:
+    if not _check_magic_bytes(content, ext):
         return FilterResult(
             status=FilterStatus.REJECTED,
             reason=RejectionReason.INVALID_TYPE,
@@ -66,8 +117,6 @@ async def hard_filter(file: UploadFile, content: bytes) -> FilterResult | None:
 # Layer 2: Content Classifier
 # ─────────────────────────────────────────
 async def content_classifier(text_preview: str, word_count: int) -> FilterResult | None:
-    """Uses Groq (Llama 3.3) to classify if content is educational."""
-
     if word_count < settings.MIN_WORD_COUNT:
         return FilterResult(
             status=FilterStatus.REJECTED,
@@ -77,7 +126,6 @@ async def content_classifier(text_preview: str, word_count: int) -> FilterResult
         )
 
     preview = " ".join(text_preview.split()[:800])
-
     prompt = f"""Analyze this document excerpt and respond ONLY with a JSON object, no extra text.
 
 Document excerpt:
@@ -96,7 +144,7 @@ Respond with exactly this JSON structure:
 Consider educational: academic papers, textbooks, articles, tutorials, research, reports, study materials.
 Consider NOT educational: chat logs, spam, random text, personal diaries, shopping lists."""
 
-    raw = _call_groq(prompt, max_tokens=200)
+    raw = await _call_filter_llm(prompt, max_tokens=200)
     result = _parse_json(raw)
 
     if not result.get("is_educational", False) or result.get("confidence", 0) < 0.5:
@@ -113,9 +161,7 @@ Consider NOT educational: chat logs, spam, random text, personal diaries, shoppi
 
 
 async def get_classification(text_preview: str) -> dict:
-    """Gets topic + confidence after content passes — used downstream."""
     preview = " ".join(text_preview.split()[:800])
-
     prompt = f"""Analyze this document excerpt and respond ONLY with a JSON object.
 
 Document excerpt:
@@ -131,7 +177,7 @@ Respond with exactly this JSON:
   "reason": "one sentence explanation"
 }}"""
 
-    raw = _call_groq(prompt, max_tokens=200)
+    raw = await _call_filter_llm(prompt, max_tokens=200)
     return _parse_json(raw)
 
 
@@ -139,10 +185,7 @@ Respond with exactly this JSON:
 # Layer 3: Safety Filter
 # ─────────────────────────────────────────
 async def safety_filter(text_preview: str) -> FilterResult | None:
-    """Uses Groq (Llama 3.3) to check for harmful content."""
-
     preview = " ".join(text_preview.split()[:600])
-
     prompt = f"""Review this document excerpt for harmful content and respond ONLY with JSON.
 
 Document excerpt:
@@ -159,7 +202,7 @@ Respond with exactly this JSON:
 Flag as unsafe ONLY if content contains: hate speech, violence instructions, illegal activities, explicit adult content, self-harm instructions.
 Educational content about sensitive topics (history, medicine, law) is safe."""
 
-    raw = _call_groq(prompt, max_tokens=100)
+    raw = await _call_filter_llm(prompt, max_tokens=100)
     result = _parse_json(raw)
 
     if not result.get("is_safe", True):
@@ -178,27 +221,18 @@ Educational content about sensitive topics (history, medicine, law) is safe."""
 async def run_filter_pipeline(
     file: UploadFile, content: bytes, extracted_text: str, word_count: int
 ) -> FilterResult:
-    """
-    Runs all 3 filter layers in sequence.
-    Stops immediately on first rejection.
-    """
-
-    # Layer 1: Hard filter — no LLM, instant
     result = await hard_filter(file, content)
     if result:
         return result
 
-    # Layer 2: Content classifier — Groq Llama 3.3
     result = await content_classifier(extracted_text, word_count)
     if result:
         return result
 
-    # Layer 3: Safety check — Groq Llama 3.3
     result = await safety_filter(extracted_text)
     if result:
         return result
 
-    # All passed — fetch topic for downstream use
     classification = await get_classification(extracted_text)
 
     return FilterResult(
