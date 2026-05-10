@@ -7,7 +7,6 @@ from app.core.schemas import FilterResult, FilterStatus, RejectionReason
 
 groq_client = Groq(api_key=settings.GROQ_API_KEY)
 
-# Magic bytes for file type detection
 MAGIC_BYTES = {
     "pdf": [b"%PDF"],
     "docx": [b"PK\x03\x04"],
@@ -16,7 +15,7 @@ MAGIC_BYTES = {
 
 
 # ─────────────────────────────────────────
-# LLM Caller with Fallback
+# LLM Callers
 # ─────────────────────────────────────────
 def _call_groq(prompt: str, max_tokens: int = 200) -> str:
     """Primary: Groq Llama 3.3."""
@@ -29,8 +28,8 @@ def _call_groq(prompt: str, max_tokens: int = 200) -> str:
     return response.choices[0].message.content.strip()
 
 
-async def _call_openrouter(prompt: str, max_tokens: int = 200) -> str:
-    """Backup: OpenRouter (Qwen3 free) — used when Groq hits rate limit."""
+async def _call_openrouter_model(prompt: str, model: str, max_tokens: int = 200) -> str:
+    """Generic OpenRouter caller — works for any model on OpenRouter."""
     headers = {
         "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -38,7 +37,7 @@ async def _call_openrouter(prompt: str, max_tokens: int = 200) -> str:
         "X-Title": "Notebook LLM",
     }
     payload = {
-        "model": settings.OPENROUTER_MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0,
@@ -51,19 +50,44 @@ async def _call_openrouter(prompt: str, max_tokens: int = 200) -> str:
         )
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"]["content"]
+        if not content or not content.strip():
+            raise ValueError(f"OpenRouter model {model} returned empty response")
+        return content.strip()
 
 
 async def _call_filter_llm(prompt: str, max_tokens: int = 200) -> str:
     """
-    Tries Groq first, falls back to OpenRouter if Groq fails.
-    Groq fails on: rate limit (429), service errors (5xx).
+    Filter LLM with 3-level fallback:
+    1. Groq Llama 3.3          — Primary
+    2. OpenRouter Qwen3 480B   — Backup 1
+    3. OpenRouter Z.ai GLM 4.5 Air — Backup 2 (same API key, different model)
     """
-    try:
-        return _call_groq(prompt, max_tokens)
-    except Exception as e:
-        print(f"[Filter] Groq failed: {e} — falling back to OpenRouter...")
-        return await _call_openrouter(prompt, max_tokens)
+    providers = [
+        ("Groq Llama 3.3",
+            lambda: _call_groq(prompt, max_tokens)),
+        ("OpenRouter Qwen3 480B",
+            lambda: _call_openrouter_model(prompt, settings.OPENROUTER_MODEL, max_tokens)),
+        ("OpenRouter Z.ai GLM 4.5 Air",
+            lambda: _call_openrouter_model(prompt, "z-ai/glm-4.5-air:free", max_tokens)),
+    ]
+
+    last_error = None
+    for name, call in providers:
+        try:
+            if name == "Groq Llama 3.3":
+                result = call()      # sync
+            else:
+                result = await call()  # async
+            print(f"[Filter] Success: {name}")
+            return result
+        except Exception as e:
+            last_error = e
+            reason = "rate limit" if ("429" in str(e) or "rate" in str(e).lower()) else "error"
+            print(f"[Filter] {name} failed ({reason}) — trying next...")
+            continue
+
+    raise RuntimeError(f"All filter providers failed. Last error: {last_error}")
 
 
 def _parse_json(raw: str) -> dict:
@@ -85,7 +109,6 @@ def _check_magic_bytes(content: bytes, ext: str) -> bool:
 # Layer 1: Hard Filter
 # ─────────────────────────────────────────
 async def hard_filter(file: UploadFile, content: bytes) -> FilterResult | None:
-    """Validates file type and size. No LLM — pure Python."""
     ext = file.filename.split(".")[-1].lower() if "." in file.filename else ""
 
     if ext not in settings.ALLOWED_EXTENSIONS:
