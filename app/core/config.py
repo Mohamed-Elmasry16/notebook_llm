@@ -26,8 +26,8 @@ class Settings(BaseSettings):
     # Get key from: aistudio.google.com
     # ─────────────────────────────────────────
     GEMINI_API_KEY: str = ""
-    GEMINI_BACKUP_1 = gemini-2.5-flash-lite
-    GEMINI_BACKUP_2 = gemini-2.5-flash
+    GEMINI_BACKUP_1 = "gemini-2.5-flash-lite"
+    GEMINI_BACKUP_2 = "gemini-2.5-flash"
 
     # ─────────────────────────────────────────
     # YouTube Data API v3
